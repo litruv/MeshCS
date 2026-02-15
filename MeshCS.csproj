@@ -6,11 +6,34 @@
     <Nullable>enable</Nullable>
     <RootNamespace>MeshCS</RootNamespace>
     <AssemblyName>MeshCS</AssemblyName>
+    
+    <!-- Package Info -->
+    <PackageId>MeshCS</PackageId>
     <Version>1.0.0</Version>
-    <Authors>MeshBBS</Authors>
-    <Description>C# library for communicating with MeshCore companion radios via serial port. Supports commands, parsing, and high-level async API.</Description>
-    <PackageTags>meshcore;lora;mesh;radio;serial</PackageTags>
+    <Authors>Litruv</Authors>
+    <Company>MeshBBS</Company>
+    <Copyright>Copyright © 2026 Litruv</Copyright>
+    <Description>C# library for communicating with MeshCore companion radios via serial port. Supports command building, packet parsing, and high-level async API with events.</Description>
+    <PackageTags>meshcore;lora;mesh;radio;serial;iot;meshtastic</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Litruv/MeshCS</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Litruv/MeshCS</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>Initial release with full MeshCore companion radio support.</PackageReleaseNotes>
+    
+    <!-- Build Settings -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <Deterministic>true</Deterministic>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="" />
+    <None Include="LICENSE" Pack="true" PackagePath="" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="System.IO.Ports" Version="8.0.0" />

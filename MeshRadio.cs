@@ -631,6 +631,9 @@ public sealed class MeshRadio : IDisposable
         }
     }
 
+    /// <summary>
+    /// Releases all resources used by the MeshRadio.
+    /// </summary>
     public void Dispose()
     {
         if (_disposed) return;
