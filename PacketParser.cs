@@ -177,8 +177,9 @@ public static class PacketParser
     /// </summary>
     public static Channel? ParseChannelInfo(ReadOnlySpan<byte> packet)
     {
-        // ChannelInfo: code(1) + index(1) + name(32) + secret(16) + flags(1)
-        if (packet.Length < 51 || GetBaseCode(packet) != (byte)Response.ChannelInfo)
+        // ChannelInfo: code(1) + index(1) + name(32) + secret(16) + [flags(1) optional]
+        // Some firmware versions omit the flags byte
+        if (packet.Length < 50 || GetBaseCode(packet) != (byte)Response.ChannelInfo)
             return null;
 
         var pos = 1;
@@ -283,13 +284,14 @@ public static class PacketParser
         var pos = 1;
 
         // V3: code(1) + txtType(1) + channelIdx(1) + pathLen(1) + senderTs(4) + snr(1) + nameLen(1) + name... + payload
-        // V2: code(1) + channelIdx(1) + pathLen(1) + txtType(1) + senderTs(4) + payload
+        // V2: code(1) + channelIdx(1) + pathLen(1) + txtType(1) + senderTs(4) + senderPubKey(32) + ": " + text
         byte channelIndex;
         TextType textType;
         byte pathLen;
         uint timestamp;
         sbyte snr = 0;
         string senderName = "";
+        byte[] senderPubKey = [];
         byte[] payload;
 
         if (isV3)
@@ -319,7 +321,30 @@ public static class PacketParser
             pathLen = packet[pos++];
             textType = (TextType)packet[pos++];
             timestamp = ReadUInt32LE(packet, ref pos);
-            payload = packet[pos..].ToArray();
+            
+            // V2 payload format: senderBlob + ": " (0x3A 0x20) + text
+            // The sender blob is a variable-length identity (pubkey hash/suffix).
+            // Search for the ": " separator to split sender from message.
+            var rawPayload = packet[pos..];
+            var separatorIdx = -1;
+            for (var i = 0; i < rawPayload.Length - 1; i++)
+            {
+                if (rawPayload[i] == (byte)':' && rawPayload[i + 1] == (byte)' ')
+                {
+                    separatorIdx = i;
+                    break;
+                }
+            }
+
+            if (separatorIdx > 0)
+            {
+                senderPubKey = rawPayload[..separatorIdx].ToArray();
+                payload = rawPayload[(separatorIdx + 2)..].ToArray();
+            }
+            else
+            {
+                payload = rawPayload.ToArray();
+            }
         }
 
         return new ChannelMessage
@@ -330,6 +355,7 @@ public static class PacketParser
             Timestamp = timestamp,
             Snr = snr,
             SenderName = senderName.TrimEnd('\0'),
+            SenderPubKey = senderPubKey,
             Payload = payload,
             IsV3 = isV3
         };

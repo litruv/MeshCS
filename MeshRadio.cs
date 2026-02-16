@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.IO.Ports;
 using System.Text;
+using MeshCS.Transport;
 
 namespace MeshCS;
 
@@ -31,7 +32,7 @@ public sealed class ScanResult
 /// </summary>
 public sealed class MeshRadio : IDisposable
 {
-    private readonly SerialPort _serial;
+    private readonly IMeshTransport _transport;
     private readonly ConcurrentQueue<byte[]> _rxQueue = new();
     private readonly ConcurrentQueue<DirectMessage> _messageQueue = new();
     private readonly ConcurrentQueue<ChannelMessage> _channelMessageQueue = new();
@@ -48,8 +49,8 @@ public sealed class MeshRadio : IDisposable
     /// <summary>Device info, populated after DeviceQueryAsync().</summary>
     public DeviceInfo? Device { get; private set; }
 
-    /// <summary>Whether the serial port is open.</summary>
-    public bool IsConnected => _serial.IsOpen;
+    /// <summary>Whether the transport is connected.</summary>
+    public bool IsConnected => _transport.IsOpen;
 
     /// <summary>Number of direct messages pending in the local queue.</summary>
     public int PendingMessageCount => _messageQueue.Count;
@@ -305,30 +306,45 @@ public sealed class MeshRadio : IDisposable
     }
 
     /// <summary>
-    /// Creates a new MeshRadio instance.
+    /// Creates a new MeshRadio instance with a transport.
+    /// </summary>
+    /// <param name="transport">The transport to use for communication.</param>
+    public MeshRadio(IMeshTransport transport)
+    {
+        _transport = transport;
+    }
+
+    /// <summary>
+    /// Creates a new MeshRadio instance using serial port.
     /// </summary>
     /// <param name="portName">Serial port name (e.g., "COM11" or "/dev/ttyUSB0").</param>
     /// <param name="baudRate">Baud rate (default 115200).</param>
     public MeshRadio(string portName, int baudRate = 115200)
+        : this(new SerialTransport(portName, baudRate))
     {
-        _serial = new SerialPort(portName, baudRate, Parity.None, 8, StopBits.One)
-        {
-            ReadTimeout = 100,
-            WriteTimeout = 1000
-        };
     }
 
     /// <summary>
-    /// Opens the serial connection and initializes the companion session.
+    /// Creates a new MeshRadio instance connecting via TCP/WiFi.
+    /// </summary>
+    /// <param name="host">Host address (e.g., "192.168.1.201").</param>
+    /// <param name="port">Port number (e.g., 5000).</param>
+    public static MeshRadio CreateTcp(string host, int port)
+    {
+        return new MeshRadio(new TcpTransport(host, port));
+    }
+
+    /// <summary>
+    /// Opens the transport connection and initializes the companion session.
     /// </summary>
     /// <param name="appName">Application name to identify to the device.</param>
     /// <param name="ct">Cancellation token.</param>
     public async Task ConnectAsync(string appName = "MeshCore", CancellationToken ct = default)
     {
-        if (_serial.IsOpen)
+        if (_transport.IsOpen)
             throw new InvalidOperationException("Already connected");
 
-        _serial.Open();
+        await _transport.OpenAsync(ct);
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _readTask = Task.Run(() => ReadLoop(_cts.Token), _cts.Token);
 
@@ -393,8 +409,9 @@ public sealed class MeshRadio : IDisposable
     public async Task<bool> SendChannelMessageAsync(byte channelIndex, string text, CancellationToken ct = default)
     {
         var packet = PacketBuilder.SendChannelMsg(channelIndex, text);
-        var response = await SendCommandAsync(packet, Response.Sent, 5000, ct);
-        return PacketParser.IsSent(response);
+        // Device returns Ok (0x00) for channel messages, not Sent (0x07)
+        var response = await SendCommandAsync(packet, Response.Ok, 5000, ct);
+        return PacketParser.IsOk(response);
     }
 
     /// <summary>
@@ -409,6 +426,37 @@ public sealed class MeshRadio : IDisposable
         if (PacketParser.IsNoMoreMessages(response))
             return null;
 
+        return PacketParser.ParseDirectMessage(response);
+    }
+
+    /// <summary>
+    /// Fetches the next waiting message, handling both direct and channel messages.
+    /// Channel messages are fired via the ChannelMessageReceived event.
+    /// </summary>
+    /// <returns>DirectMessage if it was a DM, null if channel message or no more messages.</returns>
+    public async Task<DirectMessage?> FetchNextMessageAsync(CancellationToken ct = default)
+    {
+        var packet = PacketBuilder.GetMsg();
+        var response = await SendCommandAsync(packet, null, 2000, ct);
+
+        if (PacketParser.IsNoMoreMessages(response))
+            return null;
+
+        var code = PacketParser.GetBaseCode(response);
+        
+        // Check if it's a channel message (0x08 or 0x11)
+        if (code == (byte)Response.ChannelMsg || code == (byte)Response.ChannelMsgV3)
+        {
+            var channelMsg = PacketParser.ParseChannelMessage(response);
+            if (channelMsg != null)
+            {
+                _channelMessageQueue.Enqueue(channelMsg);
+                ChannelMessageReceived?.Invoke(channelMsg);
+            }
+            return null;
+        }
+
+        // Otherwise try to parse as direct message
         return PacketParser.ParseDirectMessage(response);
     }
 
@@ -512,9 +560,21 @@ public sealed class MeshRadio : IDisposable
     /// <param name="ct">Cancellation token.</param>
     public async Task<Channel?> GetChannelAsync(byte channelIndex, CancellationToken ct = default)
     {
-        var packet = PacketBuilder.GetChannel(channelIndex);
-        var response = await SendCommandAsync(packet, Response.ChannelInfo, 2000, ct);
-        return PacketParser.ParseChannelInfo(response);
+        try
+        {
+            var packet = PacketBuilder.GetChannel(channelIndex);
+            var response = await SendCommandAsync(packet, Response.ChannelInfo, 2000, ct);
+            
+            if (VerboseLogging)
+                Console.WriteLine($"[MeshRadio] GetChannel response: {BitConverter.ToString(response).Replace("-", "")}");
+            
+            return PacketParser.ParseChannelInfo(response);
+        }
+        catch (TimeoutException)
+        {
+            Console.WriteLine("[MeshRadio] GetChannel timed out (device may not support GetChannel)");
+            return null;
+        }
     }
 
     /// <summary>
@@ -618,15 +678,15 @@ public sealed class MeshRadio : IDisposable
     }
 
     /// <summary>
-    /// Closes the serial connection.
+    /// Closes the transport connection.
     /// </summary>
     public void Disconnect()
     {
         _cts?.Cancel();
         try { _readTask?.Wait(1000); } catch { }
-        if (_serial.IsOpen)
+        if (_transport.IsOpen)
         {
-            _serial.Close();
+            _transport.Close();
             Disconnected?.Invoke();
         }
     }
@@ -640,7 +700,7 @@ public sealed class MeshRadio : IDisposable
         _disposed = true;
         Disconnect();
         _cts?.Dispose();
-        _serial.Dispose();
+        _transport.Dispose();
         _sendLock.Dispose();
     }
 
@@ -655,16 +715,24 @@ public sealed class MeshRadio : IDisposable
         await _sendLock.WaitAsync(ct);
         try
         {
-            // COBS encode
-            var encoded = CobsEncode(packet);
-            var frame = new byte[encoded.Length + 1];
-            Buffer.BlockCopy(encoded, 0, frame, 0, encoded.Length);
-            frame[^1] = 0x00; // Frame delimiter
-
             if (VerboseLogging)
                 Console.WriteLine($"[MeshRadio] TX: {BitConverter.ToString(packet).Replace("-", " ")}");
 
-            _serial.Write(frame, 0, frame.Length);
+            if (_transport.RequiresCobsFraming)
+            {
+                // Serial: COBS encode with 0x00 delimiter
+                var encoded = CobsEncode(packet);
+                var frame = new byte[encoded.Length + 1];
+                Buffer.BlockCopy(encoded, 0, frame, 0, encoded.Length);
+                frame[^1] = 0x00;
+                _transport.SendPacket(frame);
+            }
+            else
+            {
+                // TCP: transport handles framing
+                _transport.SendPacket(packet);
+            }
+
             PacketSent?.Invoke(packet);
         }
         finally
@@ -694,6 +762,9 @@ public sealed class MeshRadio : IDisposable
                 // Handle errors
                 if (code == (byte)Response.Err)
                     return packet;
+
+                // Re-queue non-matching responses so they aren't lost
+                _rxQueue.Enqueue(packet);
             }
             await Task.Delay(10, ct);
         }
@@ -703,21 +774,27 @@ public sealed class MeshRadio : IDisposable
 
     private void ReadLoop(CancellationToken ct)
     {
+        if (_transport.RequiresCobsFraming)
+            ReadLoopSerial(ct);
+        else
+            ReadLoopTcp(ct);
+    }
+
+    private void ReadLoopSerial(CancellationToken ct)
+    {
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                if (!_serial.IsOpen) break;
+                if (!_transport.IsOpen) break;
 
-                var available = _serial.BytesToRead;
-                if (available == 0)
+                var buffer = new byte[256];
+                var read = _transport.ReceivePacket(buffer, 0, buffer.Length);
+                if (read <= 0)
                 {
                     Thread.Sleep(10);
                     continue;
                 }
-
-                var buffer = new byte[available];
-                var read = _serial.Read(buffer, 0, available);
 
                 for (var i = 0; i < read; i++)
                 {
@@ -738,6 +815,37 @@ public sealed class MeshRadio : IDisposable
                         _rxBuffer.Add(b);
                     }
                 }
+            }
+            catch (TimeoutException) { }
+            catch (Exception ex)
+            {
+                if (VerboseLogging)
+                    Console.WriteLine($"[MeshRadio] Read error: {ex.Message}");
+                ErrorOccurred?.Invoke(ex.Message);
+            }
+        }
+    }
+
+    private void ReadLoopTcp(CancellationToken ct)
+    {
+        var buffer = new byte[4096];
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (!_transport.IsOpen) break;
+
+                var read = _transport.ReceivePacket(buffer, 0, buffer.Length);
+                if (read <= 0)
+                {
+                    Thread.Sleep(10);
+                    continue;
+                }
+
+                // TCP transport returns complete packets, no COBS decoding needed
+                var packet = new byte[read];
+                Buffer.BlockCopy(buffer, 0, packet, 0, read);
+                ProcessPacket(packet);
             }
             catch (TimeoutException) { }
             catch (Exception ex)

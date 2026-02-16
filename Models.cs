@@ -172,8 +172,16 @@ public sealed class ChannelMessage
     /// <summary>Raw payload bytes.</summary>
     public byte[] Payload { get; init; } = [];
 
-    /// <summary>Sender's display name (if available).</summary>
+    /// <summary>Sender's display name (if available, V3 only).</summary>
     public string SenderName { get; init; } = "";
+
+    /// <summary>Sender's 32-byte public key (V2 only).</summary>
+    public byte[] SenderPubKey { get; init; } = [];
+
+    /// <summary>Gets the sender's public key as hex string.</summary>
+    public string SenderPubKeyHex => SenderPubKey.Length > 0 
+        ? BitConverter.ToString(SenderPubKey).Replace("-", "") 
+        : "";
 
     /// <summary>Gets the payload as UTF-8 text.</summary>
     public string Text => Encoding.UTF8.GetString(Payload).TrimEnd('\0');
